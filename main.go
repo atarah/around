@@ -14,6 +14,12 @@ import (
 	"cloud.google.com/go/storage"
 	//"cloud.google.com/go/bigtable"
 	"io"
+	// new libs
+	"github.com/auth0/go-jwt-middleware"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
+
+	"time"
 )
 const (
 	INDEX = "around"
@@ -23,7 +29,7 @@ const (
 	PROJECT_ID = "ace-tine-185921"
 	BT_INSTANCE = "around-post"
 	// Needs to update this URL if you deploy it to cloud.
-	ES_URL = "http://104.196.1.213:9200"
+	ES_URL = "http://35.196.138.91:9200"
 	//Needs to update this buckets based on your gcs bucket name
 	BUCKET_NAME = "post-images-185921"
 )
@@ -45,6 +51,9 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+	user := r.Context().Value("user")
+	claims := user.(*jwt.Token).Claims
+	username := claims.(jwt.MapClaims)["username"]
 	// 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
 	// After you call ParseMultipartForm, the file will be saved in the server memory with maxMemory size.
 	// If the file size is larger than maxMemory, the rest of the data will be saved in a system temporary file.
@@ -54,7 +63,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	lat,_ := strconv.ParseFloat(r.FormValue("lat"), 64)
 	lon,_ := strconv.ParseFloat(r.FormValue("lon"), 64)
 	p := &Post{
-		User: "1111",
+		User: username.(string),
 		Message: r.FormValue("message"),
 		Location: Location{
 			Lat: lat,
@@ -241,6 +250,8 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Write(js)
 }
+var mySigningKey = []byte("secret")
+
 func containsFilteredWords(s *string) bool {
 	filteredWord  := []string{
 		"fuck",
@@ -281,6 +292,72 @@ func Index(words []string, keyword string) int{
 	}
 	return -1
 }
+
+
+// If login is successful, a new token is created.
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("Received one login request")
+
+	decoder := json.NewDecoder(r.Body)
+	var u User
+	if err := decoder.Decode(&u); err != nil {
+		panic(err)
+		return
+	}
+
+	if checkUser(u.Username, u.Password) {
+		token := jwt.New(jwt.SigningMethodHS256)
+		claims := token.Claims.(jwt.MapClaims)
+		/* Set token claims */
+		claims["username"] = u.Username
+		claims["exp"] = time.Now().Add(time.Hour * 24).Unix()
+
+		/* Sign the token with our secret */
+		tokenString, _ := token.SignedString(mySigningKey)
+
+		/* Finally, write the token to the browser window */
+		w.Write([]byte(tokenString))
+	} else {
+		fmt.Println("Invalid password or username.")
+		http.Error(w, "Invalid password or username", http.StatusForbidden)
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+}
+
+
+
+
+// If signup is successful, a new session is created.
+func signupHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("Received one signup request")
+
+	decoder := json.NewDecoder(r.Body)
+	var u User
+	if err := decoder.Decode(&u); err != nil {
+		panic(err)
+		return
+	}
+
+	if u.Username != "" && u.Password != "" {
+		if addUser(u.Username, u.Password) {
+			fmt.Println("User added successfully.")
+			w.Write([]byte("User added successfully."))
+		} else {
+			fmt.Println("Failed to add a new user.")
+			http.Error(w, "Failed to add a new user", http.StatusInternalServerError)
+		}
+	} else {
+		fmt.Println("Empty password or username.")
+		http.Error(w, "Empty password or username", http.StatusInternalServerError)
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+}
+
+
 func main() {
 	// Create a client
 	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
@@ -315,8 +392,19 @@ func main() {
 		}
 	}
 
-	fmt.Println("started-service")
-	http.HandleFunc("/post", handlerPost)
-	http.HandleFunc("/search", handlerSearch)
+	fmt.Println("started-service successfully")
+	//Here we are instantiating the gorilla/mux router
+	r := mux.NewRouter()
+	var jwtMiddleware = jwtmiddleware.New(jwtmiddleware.Options{ValidationKeyGetter: func(token *jwt.Token)(interface{}, error) {
+			return mySigningKey, nil
+		},
+		SigningMethod: jwt.SigningMethodHS256,
+	})
+
+	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
+	r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
+	r.Handle("/signup", http.HandlerFunc(signupHandler)).Methods("POST")
+	http.Handle("/", r)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
